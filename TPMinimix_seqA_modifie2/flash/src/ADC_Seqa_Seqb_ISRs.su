@@ -1,0 +1,4 @@
+../src/ADC_Seqa_Seqb_ISRs.c:26:6:ADC_SEQA_IRQHandler	24	static
+../src/ADC_Seqa_Seqb_ISRs.c:60:6:ADC_SEQB_IRQHandler	24	static
+../src/ADC_Seqa_Seqb_ISRs.c:89:6:ADC_THCMP_IRQHandler	8	static
+../src/ADC_Seqa_Seqb_ISRs.c:98:6:ADC_OVR_IRQHandler	8	static
