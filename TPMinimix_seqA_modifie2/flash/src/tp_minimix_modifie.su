@@ -1,5 +1,0 @@
-C:\Users\samue\Documents\MCUXpressoIDE_25.6.136\workspace\common\inc/core_cm0plus.h:611:22:NVIC_EnableIRQ	16	static
-../src/tp_minimix_modifie.c:56:6:MRT_Init_Master	8	static
-../src/tp_minimix_modifie.c:67:6:MRT_IRQHandler	8	static
-../src/tp_minimix_modifie.c:87:6:setup_general_adc	8	static
-../src/tp_minimix_modifie.c:234:5:main	16	static
