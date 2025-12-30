@@ -1,0 +1,317 @@
+#include <stdio.h>
+#include "LPC8xx.h"
+#include "adc.h"
+
+#include "dac.h"
+#include "swm.h"
+#include "syscon.h"
+#include "utilities.h"
+#include "iocon.h"
+#include "gpio.h"
+#include "chip_setup.h"
+
+// validation du projet à 17
+
+uint32_t SystemCoreClock = 15000000;
+
+void setup_debug_uart(void);
+
+const char promptstring[] = "Choose a sequence to convert:\n\ra for sequence a\n\rb for sequence b\n\r";
+
+volatile uint32_t seqa_buffer[12];
+volatile uint32_t seqb_buffer[12];
+volatile enum {false, true} seqa_handshake, seqb_handshake;
+uint32_t current_seqa_ctrl, current_seqb_ctrl;
+
+#define OUTPORT_B P0_10
+#define INPORT_B  P0_18
+#define OUTPORT_A P0_14
+#define INPORT_A  P0_19
+
+volatile uint32_t current_clkdiv, val, temp_data, n;
+
+// Acquisition des low,mid,high pour les 2 canaux
+// Tout sur le CN5 dans l'ordre de bas en haut
+#define ADC_HIGH2 (1<<10) //pin_1
+#define ADC_MID2 (1<<21) //pin_4
+#define ADC_LOW2 (1<<11) //pin7
+#define ADC_LOW1 (1<<19) //pin17
+#define ADC_MID1 (1<<13) //pin 16
+#define ADC_HIGH1 (1<<17) //pin 10
+
+// Acquisition des gains 1 et 2 sur CN8
+#define ADC_GAIN1 (1<<16) //pin11
+#define ADC_GAIN2 (1<<20)//pin13
+
+//Acquisition du signal pas stereo
+#define ADC_IN1L (1<<12) //pin14
+#define ADC_IN2L (1<<18) //pin15
+
+#define pinss {"HIGH2" , "MID2" , "LOW2","HIGH1" , "MID1" , "LOW1", "GAIN1", "GAIN2"}
+
+volatile unsigned char temp;
+
+/*****************************************************************************
+*****************************************************************************/
+
+// Variables globales
+volatile uint32_t counter_20hz = 0;
+
+volatile uint32_t gain1=1,gain2=1,low1=1,low2=1,high1=1,high2=1,mid1=1,mid2=1;
+// --- A PLACER AVANT LES FONCTIONS ---
+// Coefficients optimisés pré-calculés
+volatile int32_t C_L1 = 0, C_M1 = 0, C_H1 = 0;
+volatile int32_t C_L2 = 0, C_M2 = 0, C_H2 = 0;
+// Variable globale (doit être accessible)
+volatile uint32_t counter_div = 0;
+
+void MRT_Init_Master(void) {
+    LPC_SYSCON->SYSAHBCLKCTRL0 |= (1 << 10);
+    LPC_SYSCON->PRESETCTRL0 &= ~(1 << 10);
+    LPC_SYSCON->PRESETCTRL0 |= (1 << 10);
+
+    // Timer réglé à 40 kHz (une interruption toutes les 25µs)
+    LPC_MRT->Channel[0].INTVAL = (SystemCoreClock / 40000) & 0x7FFFFFFF;
+    LPC_MRT->Channel[0].CTRL = (1 << 0);
+    NVIC_EnableIRQ(MRT_IRQn);
+}
+
+void MRT_IRQHandler(void) {
+    if (LPC_MRT->Channel[0].STAT & (1 << 0)) {
+        LPC_MRT->Channel[0].STAT = (1 << 0);
+
+        // =========================================================
+        // 1. TRAITEMENT AUDIO (CENTRÉ SUR 0)
+        // =========================================================
+        static int32_t f1_low = 0, f1_wide = 0;
+        static int32_t f2_low = 0, f2_wide = 0;
+        register int32_t r_in, r_mid, r_high;
+        register int32_t total_mix = 0;
+
+        // --- Voie 1 ---
+        // 1. On récupère le signal brut (0 à 4095)
+        // 2. IMPORTANT : On soustrait 2048 pour centrer sur 0 (devient -2048 à +2047)
+        r_in = ((seqb_buffer[2] >> 4) & 0xFFF) - 2048;
+
+        f1_low  += (r_in - f1_low) >> 5;
+        f1_wide += (r_in - f1_wide) >> 2;
+
+        r_mid  = f1_wide - f1_low;
+        r_high = r_in - f1_wide;
+
+        total_mix += (f1_low * C_L1);
+        total_mix += (r_mid  * C_M1);
+        total_mix += (r_high * C_H1);
+
+        // --- Voie 2 ---
+        r_in = ((seqb_buffer[8] >> 4) & 0xFFF) - 2048; // Centrage sur 0
+
+        f2_low  += (r_in - f2_low) >> 5;
+        f2_wide += (r_in - f2_wide) >> 2;
+
+        r_mid  = f2_wide - f2_low;
+        r_high = r_in - f2_wide;
+
+        total_mix += (f2_low * C_L2);
+        total_mix += (r_mid  * C_M2);
+        total_mix += (r_high * C_H2);
+
+        // --- Sortie ---
+        // 1. Mise à l'échelle (Division par 16384 via shift)
+        total_mix = total_mix >> 14;
+
+        // 2. IMPORTANT : On rajoute le bias (2048) pour centrer le signal pour le DAC
+        total_mix += 2048;
+
+        // 3. Saturation (Clamping)
+        if (total_mix > 4095) total_mix = 4095;
+        else if (total_mix < 0) total_mix = 0;
+
+        // Envoi au DAC (12 bits -> 10 bits)
+        LPC_DAC0->CR = (total_mix >> 2) << 6;
+
+        // =========================================================
+        // 2. GESTION DES GAINS (Machine à état inchangée)
+        // =========================================================
+        counter_div++;
+
+        if (counter_div < 20000) {
+            LPC_ADC->SEQB_CTRL = current_seqb_ctrl | (1 << 26);
+        }
+        else if (counter_div == 10000) {
+            LPC_ADC->SEQA_CTRL = current_seqa_ctrl | (1 << 26);
+        }
+        else {
+            counter_div = 0;
+
+            int32_t raw_g1 = (seqa_buffer[6] >> 4)  & 0xFFF;
+            int32_t raw_g2 = (seqa_buffer[10] >> 4) & 0xFFF;
+
+            gain1 = (raw_g1 * 100) >> 12;
+            gain2 = (raw_g2 * 100) >> 12;
+
+            low1  = ((seqa_buffer[9] >> 4)  & 0xFFF) * 100 >> 12;
+            mid1  = ((seqa_buffer[3] >> 4)  & 0xFFF) * 100 >> 12;
+            high1 = ((seqa_buffer[7] >> 4)  & 0xFFF) * 100 >> 12;
+
+            low2  = ((seqa_buffer[1] >> 4)  & 0xFFF) * 100 >> 12;
+            mid2  = ((seqa_buffer[11] >> 4) & 0xFFF) * 100 >> 12;
+            high2 = ((seqa_buffer[0] >> 4)  & 0xFFF) * 100 >> 12;
+
+            C_L1 = low1 * gain1; if(C_L1 < 0) C_L1 = 0;
+            C_M1 = mid1 * gain1; if(C_M1 < 0) C_M1 = 0;
+            C_H1 = high1 * gain1; if(C_H1 < 0) C_H1 = 0;
+
+            C_L2 = low2 * gain2; if(C_L2 < 0) C_L2 = 0;
+            C_M2 = mid2 * gain2; if(C_M2 < 0) C_M2 = 0;
+            C_H2 = high2 * gain2; if(C_H2 < 0) C_H2 = 0;
+
+            LPC_ADC->SEQB_CTRL = current_seqb_ctrl | (1 << 26);
+        }
+    }
+}
+
+void setup_general_adc(){
+
+	  // Step 1. Power up and reset the ADC, and enable clocks to peripherals
+	  LPC_SYSCON->PDRUNCFG &= ~(ADC_PD);
+	  LPC_SYSCON->PRESETCTRL0 &= (ADC_RST_N);
+	  LPC_SYSCON->PRESETCTRL0 |= ~(ADC_RST_N);
+	  LPC_SYSCON->SYSAHBCLKCTRL0 |= (ADC | GPIO0 | GPIO_INT | SWM);
+	  LPC_SYSCON->ADCCLKDIV = 1;                 // Enable clock, and divide-by-1 at this clock divider
+	  LPC_SYSCON->ADCCLKSEL = ADCCLKSEL_FRO_CLK; // Use fro_clk as source for ADC async clock
+
+	  // Step 3. Configure the external pins we will use
+
+	  LPC_SWM->PINENABLE0 &= ~(ADC_0|ADC_1|ADC_2|ADC_3|ADC_5|ADC_6|ADC_7|ADC_8|ADC_9|ADC_10|ADC_11); // Fixed pin analog functions enabled
+	  LPC_SWM->PINENABLE0 |= (ADC_4); // Movable digital functions enabled
+
+	  // Configure the pin interrupt mode register (a.k.a ISEL) for level-sensitive on PINTSEL1,0 ('1' = level-sensitive)
+	  LPC_PIN_INT->ISEL |= 0x3; // level-sensitive
+
+	  // Configure the active level for PINTSEL1,0 to active-high ('1' = active-high)
+	  LPC_PIN_INT->IENF |= 0x3;  // active high
+
+	  // Enable interrupt generation for PINTSEL1,0
+	  LPC_PIN_INT->SIENR = 0x3;  // enabled
+
+	  // Step 4. Configure the ADC for the appropriate analog supply voltage using the TRM register
+	  // For a sampling rate higher than 1 Msamples/s, VDDA must be higher than 2.7 V (on the Max board it is 3.3 V)
+	  LPC_ADC->TRM &= ~(1<<ADC_VRANGE); // '0' for high voltage
+
+	  // Calibration mode = false, low power mode = false, CLKDIV = appropriate for desired sample rate.
+	  LPC_ADC->CTRL = ( (0<<ADC_CALMODE) | (0<<ADC_LPWRMODE) | (1<<ADC_CLKDIV) );
+
+	  // Step 5. Assign some ADC channels to each sequence
+	  current_seqa_ctrl = ((1<<0)|(1<<1)|(1<<3)|(1<<5)|(1<<6)|(1<<9)|(1<<10)|(1<<11))<<ADC_CHANNELS;
+	  LPC_ADC->SEQA_CTRL = current_seqa_ctrl;
+	  current_seqb_ctrl = ((1<<2)|(1<<8))<<ADC_CHANNELS;
+	  LPC_ADC->SEQB_CTRL = current_seqb_ctrl;
+
+	  // Step 6. Select a trigger source for each of the sequences
+	  // Let sequence A trigger = PININT0_IRQ. Connected to an external pin using PINTSELs above.
+	  // Let sequence B trigger = PININT1_IRQ. Connected to an external pin using PINTSELs above.
+
+	  current_seqa_ctrl |= NO_TRIGGER<<ADC_TRIGGER;
+	  current_seqb_ctrl |= NO_TRIGGER<<ADC_TRIGGER;
+
+
+	  // Step 8. Choose (1) to bypass, or (0) not to bypass the hardware trigger synchronization
+	  // Since our trigger sources are on-chip, system clock based, we may bypass.
+	  current_seqa_ctrl |= 1<<ADC_SYNCBYPASS;
+	  current_seqb_ctrl |= 1<<ADC_SYNCBYPASS;
+
+	  // Step 9. Choose burst mode (1) or no burst mode (0) for each of the sequences
+	  // Let sequences A and B use no burst mode
+	  current_seqa_ctrl |= 0<<ADC_BURST;
+	  current_seqb_ctrl |= 0<<ADC_BURST;
+
+	  // Step 10. Choose single step (1), or not (0), for each sequence.
+	  // Let sequences A and B use no single step
+	  current_seqa_ctrl |= 0<<ADC_SINGLESTEP;
+	  current_seqb_ctrl |= 0<<ADC_SINGLESTEP;
+
+	  // Step 11. Choose A/B sequence priority
+	  current_seqb_ctrl |= 0<<ADC_LOWPRIO;
+
+	  // Step 12. Choose end-of-sequence mode (1), or end-of-conversion mode (0), for each sequence
+	  // Let sequences A and B use end-of-sequence mode
+	  current_seqa_ctrl |= 1<<ADC_MODE;
+	  current_seqb_ctrl |= 1<<ADC_MODE;
+
+
+	  #define low_thresh (0xFFF / 3)
+	  #define high_thresh ((2 * 0xFFF) / 3)
+	  LPC_ADC->THR0_LOW = low_thresh;
+	  LPC_ADC->THR1_LOW = low_thresh;
+	  LPC_ADC->THR0_HIGH = high_thresh;
+	  LPC_ADC->THR1_HIGH = high_thresh;
+
+	  LPC_ADC->INTEN = (1<<SEQA_INTEN)|(1<<SEQB_INTEN);
+
+
+	  // Write the sequence control word with enable bit set for both sequences
+	  current_seqa_ctrl |= 1U<<ADC_SEQ_ENA;
+	  LPC_ADC->SEQA_CTRL = current_seqa_ctrl;
+
+	  current_seqb_ctrl |= 1U<<ADC_SEQ_ENA;
+	  LPC_ADC->SEQB_CTRL = current_seqb_ctrl;
+
+	  LPC_ADC->INTEN |= (1 << 0) | (1 << 1);
+
+	  // Enable ADC interrupts in the NVIC
+	  NVIC_EnableIRQ(ADC_SEQA_IRQn);
+	  NVIC_EnableIRQ(ADC_SEQB_IRQn);
+	  setvbuf(stdout, NULL, _IONBF, 0);
+
+}
+
+
+void DAC_Init(void) {
+	LPC_SYSCON->SYSAHBCLKCTRL0 |= (DAC0|IOCON);
+	LPC_SWM->PINENABLE0 &= ~(1<<23);
+
+	LPC_IOCON->DACOUT_PIN|= (0<<IOCON_MODE)|(1<<IOCON_DAC_ENABLE);
+
+	LPC_SYSCON->PDRUNCFG &= ~(DAC0_PD);
+
+	LPC_DAC0->CTRL = 0;
+	LPC_DAC0->CR = 0;
+}
+
+
+int main(void) {
+  SystemCoreClockUpdate();
+  setup_debug_uart();
+  setup_general_adc();
+  setvbuf(stdout, NULL, _IONBF, 0);
+  DAC_Init();
+  printf("Test UART: Demarrage...\n\r");
+  MRT_Init_Master();
+
+  // The main loop
+  while(1) {
+
+          if (seqa_handshake) {
+              seqa_handshake = false;
+              //for (int n=0; n<12; n++) {
+				 // Vérifie si le canal est actif dans seqB
+				 //if ((current_seqb_ctrl >> n) & 0x1) {
+					 //uint32_t raw = (seqb_buffer[n] >> 4) & 0xFFF;
+					 //printf("%d:%d%%\n\r", n, (raw * 100)/4095);
+					 //printf("s:%d%%\n\r", ((LPC_DAC0->CR & 0b111111111100000)>>6)*100/1023);
+					 //printf("g1:%d%%\n\r",  ((seqb_buffer[n] >> 4) & 0xFFF * 100)/4095);
+
+				 //}
+			//}
+          }
+
+          // --- Gestion Séquence B (Lente - 20Hz) ---
+          if (seqb_handshake) {
+              seqb_handshake = false;
+
+          }
+      }
+
+} // end of main
+
