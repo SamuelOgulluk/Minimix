@@ -135,7 +135,7 @@ void MRT_IRQHandler(void) {
         if (counter_div < 20000) {
             LPC_ADC->SEQB_CTRL = current_seqb_ctrl | (1 << 26);
         }
-        else if (counter_div == 10000) {
+        else if (counter_div == 20000) {
             LPC_ADC->SEQA_CTRL = current_seqa_ctrl | (1 << 26);
         }
         else {
@@ -260,4 +260,5 @@ int main(void) {
       }
 
 } // end of main
+
 
